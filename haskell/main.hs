@@ -1,91 +1,121 @@
 
-import Control.Monad.Except
-
 import System.IO
 import System.Directory(getTemporaryDirectory)
 import System.Environment
+import System.Directory
 import System.Console.GetOpt
 
-data Error = Error { msg :: String }
+import Text.Read
+
+data Error = Error { errmsg :: String }
 data Nat = Zero | Suc Nat
+  deriving (Show, Read)
 
 data Backend
-  = File     {path :: String}
-  | TCP      {url  :: String}
-  | Database {url  :: String}
+  = File     { path :: FilePath }
+  | TCP      { url  :: String }
+  | Database { url  :: String }
+  | GRPC     { url  :: String }
 
-connect :: Backend -> IO ()
-connect File     {path = p} = error "not implemented"
-connect TCP      {url  = p} = error "not implemented"
-connect Database {url  = p} = error "not implemented"
+-- shared secret: pubKey is also private key
+data SignatureAlgorithm = SharedSecret
+  deriving (Show, Read)
 
-data Options = Options
-  {
-  backend :: Backend
-  }
+data VoterCryptographicInformation = VoterCryptographicInformation {
+  algo   :: SignatureAlgorithm,
+  pubKey :: String
+} deriving (Show, Read)
 
-data Voter = Voter
-  {
-  id           :: Nat,
-  voiceCredits :: Nat
-  }
+data Voter = Voter {
+  voterId            :: Nat,
+  voiceCreditBalance :: Nat,
+  crypto             :: VoterCryptographicInformation
+} deriving (Show, Read)
 
-data Alternative = Alternative
-  {
+data Alternative = Alternative {
   alternativeDescription  :: String,
   votesFor                :: Integer,
   votesAgainst            :: Integer
-  }
-  deriving Show
+} deriving (Show, Read)
 
-data Issue = Issue
-  {
+data Issue = Issue {
   issueDescription  :: String,
   alternatives      :: [Alternative]
-  }
-  deriving Show
+} deriving (Show, Read)
 
-data PollState = PollState
-  {
+data PollState = PollState {
   voters :: [Voter],
   issues :: [Issue]
-  }
+} deriving (Show, Read)
 
-data Poll = Poll
-  {
-  opts  :: Options,
+data Poll = Poll {
   state :: PollState
-  }
+}
 
-newPoll :: Options -> IO Poll
-newPoll options = do
-  return Poll
-    {
-    opts  = options,
-    state = PollState
-      {
+newPoll :: IO Poll
+newPoll = do
+  return Poll {
+    state = PollState {
       voters = [],
       issues = []
-      }
     }
+  }
 
-send :: Backend -> PollState -> Maybe Error
-send _ _ = error "not implemented"
+send :: Backend -> PollState -> IO (Maybe Error)
+send File { path = p } state' = do
+  content <- readFile p
+  case (readMaybe content :: Maybe PollState) of
+    Nothing -> return $ Just Error { errmsg = "could not parse state" }
+    Just state ->
+      if isValidTransition state state'
+         then do
+           writeFile p (show state')
+           return Nothing
+         else return $ Just Error { errmsg = "state transition is invalid" }
+send _ _ = do return $ Just Error { errmsg = "not implemented" }
 
-recv :: Backend -> Either PollState Error
-recv _ = error "not implemented"
+isValidTransition :: PollState -> PollState -> Bool
+isValidTransition state state' = error "not implemented"
+  --the square of the number of voice credits spent
+  --is equal to the sums of the squares of all the votes cast
+  --
+  --if a voice credit balance changes, the transaction must be
+  --signed by all voters whose balance changed
 
 main :: IO ()
 main = do
-  opts <- do
-    dir <- getTemporaryDirectory
-    (file, handle) <- openTempFile dir "poll-state"
-    putStrLn $ "using temp file " ++ file
-    return Options {backend = File {path = file}}
-  poll <- newPoll opts
+  dir <- getTemporaryDirectory
+  (file, handle) <- openTempFile dir "poll-state"
+  putStrLn $ "using temp file " ++ file
+  poll <- newPoll
+  putStrLn "writing initial state to file"
+  hPutStr handle $ show (state poll)
+  let backend = File { path = file }
+   in do
+     putStrLn "applying user transformation"
+     applyUserTransformation backend poll
+     removeFile file
+     return ()
+
+applyUserTransformation :: Backend -> Poll -> IO ()
+applyUserTransformation backend poll = do
   putStrLn "? for help"
-  poll <- promptUser poll
-  return ()
+  poll' <- promptUser poll
+  err   <- send backend (state poll')
+  case err of
+    Nothing -> return ()
+    Just Error {errmsg = msg} -> do
+      putStrLn msg
+      putStrLn "Select one of the following:"
+      putStrLn " [1] Start over"
+      putStrLn " [2] Edit with current poll state"
+      putStrLn " [0] Exit"
+      sel <- getLine
+      case sel of
+        "1" -> applyUserTransformation backend poll
+        "2" -> applyUserTransformation backend poll'
+        "0" -> return ()
+      
 
 promptUser :: Poll -> IO Poll
 promptUser poll = do
@@ -104,6 +134,9 @@ promptUser poll = do
       putStrLn " [0] Exit"
       promptUser poll
     "1" -> do
+      poll <- displayIssues poll
+      promptUser poll
+    "2" -> do
       poll <- displayIssues poll
       promptUser poll
     "5" -> do
@@ -129,7 +162,6 @@ raiseAnIssue poll = do
         alternatives     = []
       } 
       poll' = Poll {
-        opts  = opts poll,
         state = PollState {
           voters = voters $ state poll,
           issues = issues (state poll) ++ [newIssue]
