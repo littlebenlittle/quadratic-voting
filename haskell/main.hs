@@ -8,100 +8,127 @@ import System.Console.GetOpt
 import Text.Read
 
 data Error = Error { errmsg :: String }
+
 data Nat = Zero | Suc Nat
-  deriving (Show, Read)
+  deriving (Eq, Show, Read)
 
-data Backend
-  = File     { path :: FilePath }
-  | TCP      { url  :: String }
-  | Database { url  :: String }
-  | GRPC     { url  :: String }
+instance Num Nat where
+  Zero  + a = a
+  Suc a + b = Suc (a + b)
+  Zero  * a  = a
+  Suc a * b  = b + a * b
 
--- shared secret: pubKey is also private key
-data SignatureAlgorithm = SharedSecret
-  deriving (Show, Read)
+instance Ord Nat where
+  Zero    <= a = True
+  (Suc a) <= b = a <= Suc (Suc b)
 
-data VoterCryptographicInformation = VoterCryptographicInformation {
-  algo   :: SignatureAlgorithm,
-  pubKey :: String
+data Map a b = Map {
+  keys :: [a],
+  vals :: [b]
 } deriving (Show, Read)
 
-data Voter = Voter {
-  voterId            :: Nat,
-  voiceCreditBalance :: Nat,
-  crypto             :: VoterCryptographicInformation
+newMap :: Map a b
+newMap = Map { keys=[], vals=[] }
+
+appendMap :: Map a b -> a -> b -> Map a b
+appendMap Map { keys=ks, vals=vs } key val
+  = Map { keys = (key:ks), vals = (val:vs) }
+
+entries :: Map a b -> [b]
+entries Map { keys=_, vals=vs } = vs
+
+type Id = Nat
+
+type VoterId       = Id
+type IssueId       = Id
+type AlternativeId = Id
+
+type VoiceCreditsAllocated = Nat
+type VoiceCreditBalance    = Nat
+
+type VotesFor     = Nat
+type VotesAgainst = Nat
+
+type IssueDescription       = String
+type AlternativeDescription = String
+
+data VoterLedgerEntry = VoterLedgerEntry {
+  vcAllocated  :: VoiceCreditsAllocated,
+  vcBalance    :: VoiceCreditBalance
 } deriving (Show, Read)
 
-data Alternative = Alternative {
-  alternativeDescription  :: String,
-  votesFor                :: Integer,
-  votesAgainst            :: Integer
+data IssueLedgerEntry = IssueLedgerEntry {
+  issdesc :: IssueDescription,
+  issalts :: [AlternativeId]
 } deriving (Show, Read)
 
-data Issue = Issue {
-  issueDescription  :: String,
-  alternatives      :: [Alternative]
-} deriving (Show, Read)
-
-data PollState = PollState {
-  voters :: [Voter],
-  issues :: [Issue]
+data AltLedgerEntry = AltLedgerEntry {
+  altdesc      :: AlternativeDescription,
+  votesfor     :: VotesFor,
+  votesAgainst :: VotesAgainst
 } deriving (Show, Read)
 
 data Poll = Poll {
-  state :: PollState
+  voters :: Map VoterId        VoterLedgerEntry,
+  issues :: Map IssueId        IssueLedgerEntry,
+  alts   :: Map AlternativeId  AltLedgerEntry
+} deriving (Show, Read)
+
+newPoll :: Poll
+newPoll = Poll {
+  voters = newMap,
+  issues = newMap,
+  alts   = newMap
 }
 
-newPoll :: IO Poll
-newPoll = do
-  return Poll {
-    state = PollState {
-      voters = [],
-      issues = []
-    }
-  }
+newIssue :: IssueDescription -> IssueLedgerEntry
+newIssue desc = IssueLedgerEntry { issdesc=desc, issalts=[] }
 
-send :: Backend -> PollState -> IO (Maybe Error)
-send File { path = p } state' = do
+commit :: Backend -> Poll -> IO (Maybe Error)
+commit File { filepath = p, handle = h } state' = do
   content <- readFile p
-  case (readMaybe content :: Maybe PollState) of
+  case (readMaybe content :: Maybe Poll) of
     Nothing -> return $ Just Error { errmsg = "could not parse state" }
     Just state ->
       if isValidTransition state state'
          then do
-           writeFile p (show state')
+           hPutStr h (show state')
            return Nothing
          else return $ Just Error { errmsg = "state transition is invalid" }
-send _ _ = do return $ Just Error { errmsg = "not implemented" }
+commit _ _ = do return $ Just Error { errmsg = "not implemented" }
 
-isValidTransition :: PollState -> PollState -> Bool
-isValidTransition state state' = error "not implemented"
-  --the square of the number of voice credits spent
-  --is equal to the sums of the squares of all the votes cast
-  --
-  --if a voice credit balance changes, the transaction must be
-  --signed by all voters whose balance changed
+--for each issue, the square of the number of voice credits spent
+--is equal to the sums of the squares of all the votes cast
+--
+--if a voice credit balance changes, the transaction must be
+--signed by all voters whose balance changed
+
+data Backend
+  = File     { filepath :: FilePath, handle :: Handle }
+  | TCP      { url :: String }
+  | Database { url :: String }
+  | GRPC     { url :: String }
 
 main :: IO ()
 main = do
   dir <- getTemporaryDirectory
   (file, handle) <- openTempFile dir "poll-state"
   putStrLn $ "using temp file " ++ file
-  poll <- newPoll
-  putStrLn "writing initial state to file"
-  hPutStr handle $ show (state poll)
-  let backend = File { path = file }
+  let poll = newPoll
+      backend = File { filepath = file, handle = handle }
    in do
-     putStrLn "applying user transformation"
-     applyUserTransformation backend poll
-     removeFile file
-     return ()
+      putStrLn "writing initial state to file"
+      hPutStr handle $ show poll
+      putStrLn "applying user transformation"
+      applyUserTransformation backend poll
+      removeFile file
+      return ()
 
 applyUserTransformation :: Backend -> Poll -> IO ()
 applyUserTransformation backend poll = do
   putStrLn "? for help"
   poll' <- promptUser poll
-  err   <- send backend (state poll')
+  err   <- commit backend poll'
   case err of
     Nothing -> return ()
     Just Error {errmsg = msg} -> do
@@ -140,8 +167,8 @@ promptUser poll = do
       poll <- displayIssues poll
       promptUser poll
     "5" -> do
-      (poll, newIssue) <- raiseAnIssue poll
-      putStrLn $ "Issue created: " ++ (issueDescription newIssue)
+      (poll, issDescription) <- raiseAnIssue poll
+      putStrLn $ "Issue created: " ++ issDescription
       promptUser poll
     "0" -> return poll
     _   -> do
@@ -150,22 +177,57 @@ promptUser poll = do
 
 displayIssues :: Poll -> IO Poll
 displayIssues poll = do
-  putStrLn $ show $ issues $ state poll
+  putStrLn $ show $ issues $ poll
   return poll
 
-raiseAnIssue :: Poll -> IO (Poll, Issue)
+raiseAnIssue :: Poll -> IO (Poll, IssueDescription)
 raiseAnIssue poll = do
   putStrLn "Description of issue:"
   desc <- getLine
-  let newIssue = Issue {
-        issueDescription = desc,
-        alternatives     = []
-      } 
-      poll' = Poll {
-        state = PollState {
-          voters = voters $ state poll,
-          issues = issues (state poll) ++ [newIssue]
-        }
-      }
-   in do return (poll', newIssue)
+  let is     = issues poll
+      nextId = nextIssueId $ keys $ issues poll
+   in do
+    return ( Poll {
+      voters = voters poll,
+      issues = appendMap is nextId (newIssue desc),
+      alts   = alts poll
+    }, desc)
+
+nextIssueId :: [IssueId] -> IssueId
+nextIssueId issues = Suc (foldl max Zero issues)
+
+inBalance :: VoterLedgerEntry -> Bool
+inBalance v = (vcAllocated v) <= (vcBalance v)
+
+noAllocationExceedsBalance :: Poll -> Bool
+noAllocationExceedsBalance poll
+  = let ledgerEntries :: [VoterLedgerEntry]
+        ledgerEntries = entries $ voters poll
+     in all inBalance ledgerEntries
+
+allocatedVoiceCreditsAndCostsBalance :: Poll -> Bool
+allocatedVoiceCreditsAndCostsBalance poll
+  = totalVoiceCreditsAllocated poll == totalCostOfAllIssues poll
+
+isValidState :: Poll -> Bool
+isValidState state
+  = allocatedVoiceCreditsAndCostsBalance state
+ && noAllocationExceedsBalance           state
+
+totalVoiceCreditsAllocated :: Poll -> Nat
+totalVoiceCreditsAllocated state
+  = let ledgerEntry = entries (voters state)
+     in sum (map vcAllocated ledgerEntry)
+
+totalCostOfAllIssues :: Poll -> Nat
+totalCostOfAllIssues state
+  = error "not implemented"
+
+isValidTransition :: Poll -> Poll -> Bool
+isValidTransition poll poll'
+  = let ledgerEntries :: [VoterLedgerEntry]
+        ledgerEntries = entries $ voters poll
+        sumOfAllBalances = \x -> sum ( map vcBalance ledgerEntries )
+     in isValidState poll'
+     && (sumOfAllBalances poll) == (sumOfAllBalances poll')
 
