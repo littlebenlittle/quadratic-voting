@@ -1,123 +1,14 @@
 
-import System.IO
-import System.Directory(getTemporaryDirectory)
-import System.Environment
-import System.Directory
-import System.Console.GetOpt
-
 import Text.Read
 
-data Error = Error { errmsg :: String }
+import System.IO
+import System.Directory(getTemporaryDirectory, removeFile)
+import System.Environment
+import System.Console.GetOpt
 
-data Nat = Zero | Suc Nat
-  deriving (Eq, Show, Read)
-
-instance Num Nat where
-  Zero  + a = a
-  Suc a + b = Suc (a + b)
-  Zero  * a  = a
-  Suc a * b  = b + a * b
-  fromInteger x = if x < 0
-                     then error ("cannot parse " ++ show x ++ " as Nat")
-                     else intrec x (\n ->  Suc n) Zero
-
-intrec :: Integer -> (a -> a) -> a -> a
-intrec 0 _ start = start
-intrec i fn start
-  = if i < 0
-      then error "no recursion for integers less than 0"
-      else fn (intrec (i-1) fn start)
-
-instance Ord Nat where
-  Zero    <= a = True
-  (Suc a) <= b = a <= Suc (Suc b)
-
-data Map a b = Map {
-  keys :: [a],
-  vals :: [b]
-} deriving (Show, Read)
-
-newMap :: Map a b
-newMap = Map { keys=[], vals=[] }
-
-appendMap :: Map a b -> a -> b -> Map a b
-appendMap Map { keys=ks, vals=vs } key val
-  = Map { keys = (key:ks), vals = (val:vs) }
-
-entries :: Map a b -> [b]
-entries Map { keys=_, vals=vs } = vs
-
-mapLookUp :: (Eq a) => Map a b -> a -> b
-mapLookUp Map { keys=(k:ks), vals=(v:vs) } key
-  = if k == key
-       then v
-       else mapLookUp Map { keys=ks, vals=vs } key
-
-type Id = Nat
-
-type VoterId       = Id
-type IssueId       = Id
-type AlternativeId = Id
-
-type VoiceCreditsAllocated = Nat
-type VoiceCreditBalance    = Nat
-
-type VotesFor     = Nat
-type VotesAgainst = Nat
-
-type IssueDescription       = String
-type AlternativeDescription = String
-
-data VoterLedgerEntry = VoterLedgerEntry {
-  vcAllocated  :: VoiceCreditsAllocated,
-  vcBalance    :: VoiceCreditBalance
-} deriving (Show, Read)
-
-data IssueLedgerEntry = IssueLedgerEntry {
-  issdesc :: IssueDescription,
-  issalts :: [AlternativeId]
-} deriving (Show, Read)
-
-data AltLedgerEntry = AltLedgerEntry {
-  altdesc      :: AlternativeDescription,
-  votesFor     :: VotesFor,
-  votesAgainst :: VotesAgainst
-} deriving (Show, Read)
-
-data Poll = Poll {
-  voters :: Map VoterId        VoterLedgerEntry,
-  issues :: Map IssueId        IssueLedgerEntry,
-  alts   :: Map AlternativeId  AltLedgerEntry
-} deriving (Show, Read)
-
-newPoll :: Poll
-newPoll = Poll { voters=newMap, issues=newMap, alts=newMap }
-
-newIssue :: IssueDescription -> IssueLedgerEntry
-newIssue desc = IssueLedgerEntry { issdesc=desc, issalts=[] }
-
-commit :: Backend -> Poll -> IO (Maybe Error)
-commit File { filepath = p } poll' = do
-  content <- readFile p
-  putStrLn "AAA"
-  case (readMaybe content :: Maybe Poll) of
-    Nothing -> return $ Just Error { errmsg = "could not parse state" }
-    Just poll -> do
-      if isValidTransition poll poll'
-         then do
-           putStrLn "CCC"
-           handle <- openFile p WriteMode
-           hPutStr handle (show poll')
-           hClose handle
-           return Nothing
-         else return $ Just Error { errmsg = "state transition is invalid" }
-commit _ _ = do return $ Just Error { errmsg = "not implemented" }
-
-data Backend
-  = File     { filepath :: FilePath }
-  | TCP      { url :: String }
-  | Database { url :: String }
-  | GRPC     { url :: String }
+import QuadraticVoting.Base
+import QuadraticVoting.Poll
+import QuadraticVoting.Backend
 
 main :: IO ()
 main = do
@@ -172,10 +63,10 @@ promptUser poll = do
       putStrLn " [0] Exit"
       promptUser poll
     "1" -> do
-      poll <- displayIssues poll
+      displayIssues poll
       promptUser poll
     "2" -> do
-      poll <- displayIssues poll
+      displayAlternatives poll
       promptUser poll
     "5" -> do
       (poll, issDescription) <- raiseAnIssue poll
@@ -186,10 +77,20 @@ promptUser poll = do
       putStrLn $ "not implemented"
       promptUser poll
 
-displayIssues :: Poll -> IO Poll
-displayIssues poll = do
-  putStrLn $ show $ issues $ poll
-  return poll
+displayIssues :: Poll -> IO ()
+displayIssues poll = displayDescriptions issues poll
+
+displayAlternatives :: Poll -> IssueLedgerEntry -> IO ()
+displayAlternatives entry =
+  let altIds     = issalts entry
+      altsLedger = alts poll
+   in displayDescriptions $ mapfilter altIds altsLedger
+
+displayDescriptions :: [(a,b)]  -> String
+displayDescriptions pairs =
+  let pprint (id, desc) = "# " ++ show id ++ ": " ++ desc + "\n"
+      lines = map pprint pairs
+   in foldl "" (++) lines
 
 raiseAnIssue :: Poll -> IO (Poll, IssueDescription)
 raiseAnIssue poll = do
@@ -207,50 +108,15 @@ raiseAnIssue poll = do
 nextIssueId :: [IssueId] -> IssueId
 nextIssueId issues = Suc (foldl max Zero issues)
 
-inBalance :: VoterLedgerEntry -> Bool
-inBalance v = (vcAllocated v) <= (vcBalance v)
-
-noAllocationExceedsBalance :: Poll -> Bool
-noAllocationExceedsBalance poll
-  = let voterEntries = entries $ voters poll
-     in all inBalance voterEntries
-
-allocatedVoiceCreditsAndCostsBalance :: Poll -> Bool
-allocatedVoiceCreditsAndCostsBalance poll
-  = totalVoiceCreditsAllocated poll == totalCostOfAllIssues poll
-
-isValidState :: Poll -> Bool
-isValidState state
-  = allocatedVoiceCreditsAndCostsBalance state
- && noAllocationExceedsBalance           state
-
-totalVoiceCreditsAllocated :: Poll -> Nat
-totalVoiceCreditsAllocated state
-  = let voterEntries = entries (voters state)
-     in sum (map vcAllocated voterEntries)
-
-costOfAlternative :: Poll -> AlternativeId -> Nat
-costOfAlternative poll altId
- = let alt     = mapLookUp (alts poll) altId 
-       for     = votesFor alt
-       against = votesAgainst alt
-    in for*for + against*against
-
-costOfIssue :: Poll -> IssueId -> Nat
-costOfIssue poll issueId
-  = let issue = mapLookUp (issues poll) issueId 
-        alts  = issalts issue
-     in sum $ map (costOfAlternative poll) alts
-
-totalCostOfAllIssues :: Poll -> Nat
-totalCostOfAllIssues poll
-  = let issueEntries = keys $ issues poll
-     in sum (map (costOfIssue poll) issueEntries)
-
-isValidTransition :: Poll -> Poll -> Bool
-isValidTransition poll poll'
-  = let voterEntries = entries $ voters poll
-        sumOfAllBalances = \x -> sum ( map vcBalance voterEntries )
-     in isValidState poll'
-     && (sumOfAllBalances poll) == (sumOfAllBalances poll')
+displayAlternativesPrompt :: Poll -> IO ()
+displayAlternativesPrompt poll = do
+  putStrLn "Issue id?"
+  sel <- getLine
+  case (readMaybe sel :: Maybe IssueId) of
+    Nothing -> do
+      putStrLn $ "could not parse input " ++ sel
+      displayAlternativesPrompt poll
+    Just issid  -> do
+      let issueLedgerEntry = mapLookUp (issues poll) issid
+       in displayAlternatives poll $ issueLedgerEntry
 
